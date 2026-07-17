@@ -33,7 +33,7 @@ INITIAL CONFIGURATION — CONCENTRIC PLACEMENT
 
 NODE TOPOLOGY (single-parent, mirrors PrecurvedTube exactly)
 ------------------------------------------------------------
-  tube_node  (EulerImplicit + SparseLDL -- the solver scope)
+  tube_node  (EulerImplicitSolver + SparseLDL -- the solver scope)
     +-- <n>_rigid_base   (Rigid3d base DOF + proximal BC)
     +-- <n>_coss_state   (Vec3d strain DOFs + BeamHooke)
     +-- <n>_frames       (child of SolverNode ONLY -- single parent)
@@ -129,6 +129,7 @@ from init_monitoring import InitializationMonitor
 from live_monitor   import LiveContactMonitor
 from gui import CTRGuiBridge
 from protruded_shape_monitor import ProtrudedShapeMonitor
+from ctr_solver_twist_logger import CTRSolverTwistLogger
 
 MAPPING_COMPONENT = 'BeamContactMapping'
 CSV_SUFFIX = 'BCM'
@@ -163,8 +164,8 @@ T2_PARAMS = {
     'name':          'Tube_3',
     'tube_number':   3,
     'str_length':    0.33,        # total arc length [m]
-    'crv_radius':    0.06,        # curvature radius [m]
-    'crv_angle_deg': 143.239, #143.239
+    'crv_radius':    0.03,        # curvature radius [m]
+    'crv_angle_deg': 250,
     'rex':           4e-4,        # outer radius [m]
     'rin':           2.7e-4,      # inner (lumen) radius [m]
     'E':             6e10,
@@ -834,11 +835,14 @@ def add_cosserat_tube(root_node,
     # ---- Solver scope --------------------------------------------------------
     tube_node   = root_node.addChild(name)
     solver_node = tube_node.addChild('SolverNode')
-    odesolver = solver_node.addObject('EulerImplicitSolver',
-                          name='odesolver',
-                          rayleighStiffness=0.1,
-                          rayleighMass=0,
-                          firstOrder=False)
+    odesolver = solver_node.addObject(
+        'EulerImplicitSolver',
+        name='odesolver',
+        rayleighStiffness=0.1,
+        rayleighMass=0,
+        firstOrder=False,
+        computeResidual=True,
+    )
 
     solver_node.addObject('SparseLDLSolver',
                           name='Solver',
@@ -859,7 +863,7 @@ def add_cosserat_tube(root_node,
         showObject=True,
         showObjectScale=0.001,
     )
-    rigid_base.addObject('UniformMass', name='baseMass', totalMass=0.001)
+    rigid_base.addObject('UniformMass', name='baseMass', totalMass=1e-6)
 
     # Motor-held base model: the base remains solver-owned, but every Rigid3d
     # component is pulled to the external control pose. During initialization the
@@ -1640,7 +1644,7 @@ def createScene(root_node):
         'Sofa.Component.Constraint.Lagrangian.Model',        # UnilateralLagrangianConstraint
         'Sofa.Component.Constraint.Lagrangian.Solver',       # BlockGaussSeidelConstraintSolver
         'Sofa.Component.Constraint.Projective',              # PartialFixedProjectiveConstraint
-        'Sofa.Component.LinearSolver.Direct',                # SparseLDLSolver
+        'Sofa.Component.LinearSolver.Direct',                # Solver
         'Sofa.Component.Mapping.Linear',                     # IdentityMapping
         'Sofa.Component.Mapping.NonLinear',                  # RigidMapping
         'Sofa.Component.Mass',                               # UniformMass
@@ -1664,7 +1668,7 @@ def createScene(root_node):
     # BlockGaussSeidelConstraintSolver must sit at root so its VecIds are
     # visible to all MechanicalObjects during FreeMotionAnimationLoop's
     # global visitors.
-    root_node.addObject('BlockGaussSeidelConstraintSolver',
+    constraint_solver = root_node.addObject('BlockGaussSeidelConstraintSolver',
                         name='ConstraintSolver',
                         tolerance=1e-8,
                         maxIterations=500)
@@ -1713,7 +1717,7 @@ def createScene(root_node):
         base_pos=[x_t3, 0., 0.],
         base_quat=[0., 0., 0., 1.])
 
-    t2_base_mo, t2_coss_mo, _, t2_frame_node, t2_solver= add_cosserat_tube(
+    t2_base_mo, t2_coss_mo, _, t2_frame_node, t2_solver = add_cosserat_tube(
         root_node, T2_PARAMS,
         x_offset=x_t3,
         init_strategy='conform_to_outer',
@@ -1736,8 +1740,9 @@ def createScene(root_node):
         init_dt=INIT_DT,                            # init phase dt (matches root_node.dt above)
         default_control_dt=CONTROL_DT,              # GUI Spinbox suggested value (NOT auto-applied)
         dt_min=1e-9, dt_max=1e-1,                   # allowed range in the Spinbox
-        default_trans_step_um=50,                # 5 nm/step at dt=1e-6 -> 5 mm/s
-        trans_step_min_um=0.001,                    # allow sub-micron actuation tests
+        default_trans_step_um=1000,
+        trans_step_min_um=100,                    # allow sub-micron actuation tests
+        trans_step_max_um = 10000,
     )
 
 
@@ -1757,6 +1762,32 @@ def createScene(root_node):
     # .FramesMO accesses the MechanicalObject<Rigid3d> inside it by name.
     t1_MO = t1_frame_node.FramesMO
     t2_MO = t2_frame_node.FramesMO
+
+    # Per-step logging is intentionally lightweight.  It streams a durable
+    # CSV during the run, then creates the Excel workbook and the requested
+    # six-panel PNG when the scene closes.  The local tangent of these
+    # Cosserat frames is x (the frame positions and base actuation use x), so
+    # axial twist is extracted about local x rather than local z.
+    diagnostics_dir = os.environ.get(
+        'CTR_DIAGNOSTICS_DIR',
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ctr diagnosis'))
+    os.makedirs(diagnostics_dir, exist_ok=True)
+    intersection_node.addObject(CTRSolverTwistLogger(
+        name='SolverTwistLogger',
+        root_node=root_node,
+        gui_bridge=gui_bridge,
+        outer_control_mo=tube1_control_mo,
+        inner_control_mo=tube2_control_mo,
+        outer_frames_mo=t1_MO,
+        inner_frames_mo=t2_MO,
+        outer_euler_solver=t1_solver,
+        inner_euler_solver=t2_solver,
+        contact_solver=constraint_solver,
+        csv_path=os.path.join(diagnostics_dir, 'ctr_solver_twist_log.csv'),
+        xlsx_path=os.path.join(diagnostics_dir, 'ctr_solver_twist_log.xlsx'),
+        figure_path=os.path.join(diagnostics_dir, 'ctr_solver_twist_plots.png'),
+        every_n_steps=1,
+    ))
 
 
     ssim = intersection_node.addObject(
